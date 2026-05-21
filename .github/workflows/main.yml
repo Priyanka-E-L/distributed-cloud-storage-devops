@@ -6,30 +6,30 @@ on:
       - main
 
 jobs:
-
   build:
-
     runs-on: ubuntu-latest
 
     steps:
-
       - name: Checkout Code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Setup Node.js
-        uses: actions/setup-node@v3
+        uses: actions/setup-node@v4
         with:
           node-version: 18
 
-      - name: Install Server Dependencies
+      - name: Install Docker Compose
         run: |
-          cd server
-          npm install
+          docker compose version
 
-      - name: Install Client Dependencies
+      - name: Build Containers
         run: |
-          cd client
-          npm install
+          docker compose build
 
-      - name: Docker Compose Build
-        run: docker compose build
+      - name: Start Containers
+        run: |
+          docker compose up -d
+
+      - name: Stop Containers
+        run: |
+          docker compose down
