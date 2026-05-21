@@ -41,6 +41,53 @@ const storageServers = [
 
 const CHUNK_SIZE = 1024 * 1024;
 
+const SERVER_STORAGE_LIMIT =
+  20 * 1024 * 1024; // 20MB
+
+function getServerStorageUsed(serverId) {
+
+  const fs = require('fs');
+  const path = require('path');
+
+  // const serverPath =
+  //   path.join(
+  //     __dirname,
+  //     `../../storage-${serverId}/chunks`
+  //   );
+  const serverMap = {
+  server1: '../../storage-server-1/chunks',
+  server2: '../../storage-server-2/chunks',
+  server3: '../../storage-server-3/chunks'
+};
+
+const serverPath =
+  path.join(
+    __dirname,
+    serverMap[serverId]
+  );
+
+  if (!fs.existsSync(serverPath)) {
+    return 0;
+  }
+
+  const files =
+    fs.readdirSync(serverPath);
+
+  let totalSize = 0;
+
+  files.forEach(file => {
+
+    const stats =
+      fs.statSync(
+        path.join(serverPath, file)
+      );
+
+    totalSize += stats.size;
+  });
+
+  return totalSize;
+}
+
 // ============================================
 // UPLOAD FILE
 // ============================================
@@ -99,11 +146,49 @@ router.post(
 
         console.log(`\nUploading Chunk ${i}`);
 
-        // Primary server
-        const primaryServer =
-          storageServers[
-            i % storageServers.length
-          ];
+        // // Primary server
+        // const primaryServer =
+        //   storageServers[
+        //     i % storageServers.length
+        //   ];
+         
+        let primaryServer =
+  storageServers[
+    i % storageServers.length
+  ];
+
+let attempts = 0;
+
+while (
+  getServerStorageUsed(
+    primaryServer.id
+  ) + chunks[i].length >
+  SERVER_STORAGE_LIMIT
+) {
+
+  console.log(
+    `${primaryServer.id} FULL`
+  );
+
+  primaryServer =
+    storageServers[
+      (i + attempts + 1)
+      % storageServers.length
+    ];
+
+  attempts++;
+
+  if (
+    attempts >=
+    storageServers.length
+  ) {
+
+    return res.status(500).json({
+      message:
+        'All storage servers full'
+    });
+  }
+}
 
         // Replica server
         const replicaServer =
