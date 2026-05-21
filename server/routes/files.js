@@ -7,148 +7,396 @@ const FormData = require('form-data');
 
 const router = express.Router();
 
-// Configure multer for file uploads
+// ============================================
+// MULTER CONFIGURATION
+// ============================================
+
 const storage = multer.memoryStorage();
-const upload = multer({ storage: storage });
 
-// Storage servers configuration
+const upload = multer({
+  storage: storage
+});
+
+// ============================================
+// STORAGE NODES
+// ============================================
+
 const storageServers = [
-  { id: 'server1', url: 'http://localhost:5001' },
-  { id: 'server2', url: 'http://localhost:5002' },
-  { id: 'server3', url: 'http://localhost:5003' }
+  {
+    id: 'server1',
+    url: 'http://storage1:5001'
+  },
+  {
+    id: 'server2',
+    url: 'http://storage2:5002'
+  },
+  {
+    id: 'server3',
+    url: 'http://storage3:5003'
+  }
 ];
+// ============================================
+// CHUNK SIZE = 1MB
+// ============================================
 
-// Simple round-robin load balancing
-let currentServerIndex = 0;
+const CHUNK_SIZE = 1024 * 1024;
 
-function getNextServer() {
-  const server = storageServers[currentServerIndex];
-  currentServerIndex = (currentServerIndex + 1) % storageServers.length;
-  return server;
-}
+// ============================================
+// UPLOAD FILE
+// ============================================
 
-// Upload file
-router.post('/upload', auth, upload.single('file'), async (req, res) => {
-  try {
-    if (!req.file) {
-      return res.status(400).json({ message: 'No file uploaded' });
-    }
+router.post(
+  '/upload',
+  auth,
+  upload.single('file'),
+  async (req, res) => {
 
-    console.log('File received:', req.file.originalname);
-
-    // Select server using round-robin
-    const server = getNextServer();
-    console.log('Selected server:', server);
-
-    // Upload to storage server
     try {
-      // Create form data
-      const formData = new FormData();
-      formData.append('file', req.file.buffer, {
-        filename: req.file.originalname,
-        contentType: req.file.mimetype
+
+      if (!req.file) {
+        return res.status(400).json({
+          message: 'No file uploaded'
+        });
+      }
+
+      console.log('\n================================');
+      console.log('FILE RECEIVED BY MAIN SERVER');
+      console.log('================================');
+
+      console.log({
+        originalName: req.file.originalname,
+        size: req.file.size,
+        mimetype: req.file.mimetype
       });
 
-      console.log('Uploading to storage server:', server.url);
-      
-      const response = await axios.post(`${server.url}/upload`, formData, {
-        headers: {
-          ...formData.getHeaders(),
-          'Content-Length': formData.getLengthSync()
-        },
-        timeout: 10000 // 10 second timeout
-      });
+      // ============================================
+      // SPLIT FILE INTO CHUNKS
+      // ============================================
 
-      console.log('Storage server response:', response.data);
+      const chunks = [];
 
-      // Save file metadata with actual URL
+      for (
+        let i = 0;
+        i < req.file.buffer.length;
+        i += CHUNK_SIZE
+      ) {
+        const chunk = req.file.buffer.slice(
+          i,
+          i + CHUNK_SIZE
+        );
+        chunks.push(chunk);
+      }
+
+      console.log(`\nTotal Chunks: ${chunks.length}`);
+
+      // ============================================
+      // DISTRIBUTED CHUNK STORAGE + REPLICATION
+      // ============================================
+
+      const uploadedChunks = [];
+
+      for (let i = 0; i < chunks.length; i++) {
+
+        console.log(`\nUploading Chunk ${i}`);
+
+        // Primary server
+        const primaryServer =
+          storageServers[
+            i % storageServers.length
+          ];
+
+        // Replica server
+        const replicaServer =
+          storageServers[
+            (i + 1) % storageServers.length
+          ];
+
+        const replicas = [
+          primaryServer,
+          replicaServer
+        ];
+
+        const replicaLocations = [];
+
+        for (const server of replicas) {
+
+          console.log(
+            `Sending Chunk ${i} to ${server.id}`
+          );
+
+          const formData = new FormData();
+          const chunkFilename = `chunk-${i}-${Date.now()}-${req.file.originalname}`;
+
+          formData.append(
+            'file',
+            chunks[i],
+            chunkFilename
+          );
+
+          try {
+            // Fix: Use the server base URL + /upload-chunk endpoint
+            const uploadUrl = `${server.url}/upload-chunk`;
+            
+            const response = await axios.post(
+              uploadUrl,
+              formData,
+              {
+                headers: formData.getHeaders()
+              }
+            );
+
+            console.log(
+              `Chunk ${i} replicated to ${server.id}`
+            );
+
+            replicaLocations.push({
+              serverId: server.id,
+              serverUrl: server.url,
+              filename: response.data.filename // Use the actual filename returned by storage server
+            });
+
+          } catch (err) {
+            console.error(
+              `Replication failed on ${server.id}`,
+              err.message
+            );
+          }
+        }
+
+        uploadedChunks.push({
+          chunkNumber: i,
+          replicas: replicaLocations
+        });
+      }
+
+      // ============================================
+      // SAVE METADATA IN MONGODB
+      // ============================================
+
       const newFile = new File({
-        filename: response.data.filename || req.file.originalname,
+        filename: req.file.originalname,
         originalName: req.file.originalname,
         size: req.file.size,
         fileType: req.file.mimetype,
-        serverLocations: [{
-          serverId: server.id,
-          url: `${server.url}/files/${response.data.filename}`
-        }],
+        chunks: uploadedChunks,
         owner: req.user.id
       });
 
       const savedFile = await newFile.save();
-      console.log('File saved to database:', savedFile._id);
+
+      console.log('\n================================');
+      console.log('FILE DISTRIBUTED SUCCESSFULLY');
+      console.log('================================');
 
       res.json({
-        message: 'File uploaded successfully',
+        success: true,
+        message: 'File uploaded to distributed storage system',
         file: savedFile
       });
-    } catch (storageError) {
-      console.error('Storage server error:', storageError.response?.data || storageError.message);
-      
-      // Save file metadata with error info
-      const newFile = new File({
-        filename: req.file.originalname,
-        originalName: req.file.originalname,
-        size: req.file.size,
-        fileType: req.file.mimetype,
-        serverLocations: [{
-          serverId: 'error',
-          url: `Error: ${storageError.message}`
-        }],
-        owner: req.user.id
-      });
 
-      const savedFile = await newFile.save();
-      res.status(200).json({
-        message: 'File metadata saved but storage upload failed',
-        file: savedFile,
-        storageError: storageError.message
+    } catch (err) {
+      console.error('\nUPLOAD ERROR');
+      console.error(err);
+      res.status(500).json({
+        success: false,
+        message: 'Distributed upload failed'
       });
     }
-  } catch (err) {
-    console.error('Server error:', err.message);
-    res.status(500).json({ message: 'Server error', error: err.message });
   }
-});
+);
 
-// Get user files
-router.get('/my-files', auth, async (req, res) => {
-  try {
-    const files = await File.find({ owner: req.user.id }).sort({ uploadDate: -1 });
-    res.json(files);
-  } catch (err) {
-    console.error(err.message);
-    res.status(500).send('Server error');
-  }
-});
+// ============================================
+// DOWNLOAD + FILE RECONSTRUCTION
+// ============================================
 
-// Delete file
-router.delete('/:id', auth, async (req, res) => {
-  try {
-    const file = await File.findOne({ _id: req.params.id, owner: req.user.id });
-    
-    if (!file) {
-      return res.status(404).json({ message: 'File not found' });
-    }
+router.get(
+  '/download/:id',
+  auth,
+  async (req, res) => {
 
-    // Delete from storage servers
-    for (const location of file.serverLocations) {
-      if (location.url && !location.url.startsWith('Error') && location.url !== 'temp-url') {
-        try {
-          await axios.delete(location.url);
-        } catch (err) {
-          console.error(`Failed to delete from server ${location.serverId}:`, err.message);
+    try {
+
+      const file =
+        await File.findById(req.params.id);
+
+      if (!file) {
+        return res.status(404).json({
+          message: 'File not found'
+        });
+      }
+
+      console.log('\n================================');
+      console.log('STARTING FILE RECONSTRUCTION');
+      console.log('================================');
+
+      // Sort chunks by chunkNumber
+      const sortedChunks =
+        file.chunks.sort(
+          (a, b) =>
+            a.chunkNumber - b.chunkNumber
+        );
+
+      const chunkBuffers = [];
+
+      // ============================================
+      // DOWNLOAD CHUNKS
+      // ============================================
+
+      for (const chunk of sortedChunks) {
+        let chunkDownloaded = false;
+
+        // Try replicas one by one
+        for (const replica of chunk.replicas) {
+          try {
+            // Fix: Construct proper URL for chunk download
+            const chunkUrl = `${replica.serverUrl}/chunks/${replica.filename}`;
+            
+            console.log(
+              `Downloading chunk ${chunk.chunkNumber} from ${chunkUrl}`
+            );
+
+            const response =
+              await axios.get(
+                chunkUrl,
+                {
+                  responseType: 'arraybuffer',
+                  timeout: 10000 // Add timeout
+                }
+              );
+
+            chunkBuffers.push(
+              Buffer.from(response.data)
+            );
+
+            console.log(
+              `Chunk ${chunk.chunkNumber} downloaded successfully from ${replica.serverId}`
+            );
+
+            chunkDownloaded = true;
+            break;
+
+          } catch (err) {
+            console.log(
+              `Replica failed for chunk ${chunk.chunkNumber} on ${replica.serverId}:`,
+              err.message
+            );
+          }
+        }
+
+        if (!chunkDownloaded) {
+          return res.status(500).json({
+            message: `Failed to reconstruct chunk ${chunk.chunkNumber} - no available replicas`
+          });
         }
       }
+
+      console.log('\nMerging chunks...');
+
+      // ============================================
+      // MERGE CHUNKS
+      // ============================================
+
+      const reconstructedFile =
+        Buffer.concat(chunkBuffers);
+
+      console.log(
+        'File reconstructed successfully, size:', reconstructedFile.length
+      );
+
+      // ============================================
+      // SEND FILE
+      // ============================================
+
+      res.setHeader(
+        'Content-Disposition',
+        `attachment; filename="${file.originalName}"`
+      );
+
+      res.setHeader(
+        'Content-Type',
+        file.fileType || 'application/octet-stream'
+      );
+
+      res.setHeader(
+        'Content-Length',
+        reconstructedFile.length
+      );
+
+      res.send(reconstructedFile);
+
+    } catch (err) {
+      console.error('Download error:', err);
+      res.status(500).json({
+        message: 'Download failed: ' + err.message
+      });
     }
-
-    // Delete from database
-    await File.findByIdAndDelete(req.params.id);
-
-    res.json({ message: 'File deleted successfully' });
-  } catch (err) {
-    console.error(err.message);
-    res.status(500).send('Server error');
   }
-});
+);
+
+// ============================================
+// GET USER FILES
+// ============================================
+
+router.get(
+  '/my-files',
+  auth,
+  async (req, res) => {
+    try {
+      const files =
+        await File.find({
+          owner: req.user.id
+        }).sort({
+          uploadDate: -1
+        });
+      res.json(files);
+    } catch (err) {
+      console.error(err);
+      res.status(500).json({
+        message: 'Server error'
+      });
+    }
+  }
+);
+
+// ============================================
+// DELETE FILE
+// ============================================
+
+router.delete(
+  '/:id',
+  auth,
+  async (req, res) => {
+    try {
+      const file =
+        await File.findOne({
+          _id: req.params.id,
+          owner: req.user.id
+        });
+
+      if (!file) {
+        return res.status(404).json({
+          message: 'File not found'
+        });
+      }
+
+      // TODO: Delete chunks from storage servers
+      // This would involve calling delete endpoints on storage servers
+
+      await File.findByIdAndDelete(
+        req.params.id
+      );
+
+      res.json({
+        message: 'File deleted successfully'
+      });
+
+    } catch (err) {
+      console.error(err);
+      res.status(500).json({
+        message: 'Server error'
+      });
+    }
+  }
+);
 
 module.exports = router;
